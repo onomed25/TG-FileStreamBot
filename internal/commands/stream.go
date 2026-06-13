@@ -3,6 +3,8 @@ package commands
 import (
 	"fmt"
 	"strings"
+	"sync"
+	"time"
 
 	"EverythingSuckz/fsb/config"
 	"EverythingSuckz/fsb/internal/utils"
@@ -15,6 +17,23 @@ import (
 	"github.com/gotd/td/telegram/message/styling"
 	"github.com/gotd/td/tg"
 )
+
+var (
+	userMutexes sync.Map
+)
+
+func getUserMutex(userID int64) *sync.Mutex {
+	val, _ := userMutexes.LoadOrStore(userID, &sync.Mutex{})
+	return val.(*sync.Mutex)
+}
+
+func isFloodWaitError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	return strings.Contains(errStr, "FLOOD_WAIT") || strings.Contains(errStr, "code 420")
+}
 
 func (m *command) LoadStream(dispatcher dispatcher.Dispatcher) {
 	log := m.log.Named("start")
@@ -58,10 +77,19 @@ func sendLink(ctx *ext.Context, u *ext.Update) error {
 		ctx.Reply(u, ext.ReplyTextString("Sorry, this message type is unsupported."), nil)
 		return dispatcher.EndGroups
 	}
+	mu := getUserMutex(chatId)
+	mu.Lock()
+	defer func() {
+		time.Sleep(4 * time.Second)
+		mu.Unlock()
+	}()
+
 	update, err := utils.ForwardMessages(ctx, chatId, config.ValueOf.LogChannelID, u.EffectiveMessage.ID)
 	if err != nil {
 		utils.Logger.Sugar().Error(err)
-		ctx.Reply(u, ext.ReplyTextString(fmt.Sprintf("Error - %s", err.Error())), nil)
+		if !isFloodWaitError(err) {
+			ctx.Reply(u, ext.ReplyTextString(fmt.Sprintf("Error - %s", err.Error())), nil)
+		}
 		return dispatcher.EndGroups
 	}
 	if len(update.Updates) < 2 {
@@ -98,7 +126,6 @@ func sendLink(ctx *ext.Context, u *ext.Update) error {
 	)
 	hash := utils.GetShortHash(fullHash)
 	link := fmt.Sprintf("%s/stream/%d?hash=%s", config.ValueOf.Host, messageID, hash)
-	text := styling.Code(link)
 	row := tg.KeyboardButtonRow{
 		Buttons: []tg.KeyboardButtonClass{
 			&tg.KeyboardButtonURL{
@@ -116,21 +143,26 @@ func sendLink(ctx *ext.Context, u *ext.Update) error {
 	markup := &tg.ReplyInlineMarkup{
 		Rows: []tg.KeyboardButtonRow{row},
 	}
-	if strings.Contains(link, "http://localhost") {
-		_, err = ctx.Reply(u, ext.ReplyTextStyledText(text), &ext.ReplyOpts{
-			NoWebpage:        false,
-			ReplyToMessageId: u.EffectiveMessage.ID,
-		})
-	} else {
-		_, err = ctx.Reply(u, ext.ReplyTextStyledText(text), &ext.ReplyOpts{
-			Markup:           markup,
-			NoWebpage:        false,
-			ReplyToMessageId: u.EffectiveMessage.ID,
-		})
-	}
+	toPeer, err := utils.GetLogChannelPeer(ctx, ctx.Raw, ctx.PeerStorage)
 	if err != nil {
 		utils.Logger.Sugar().Error(err)
-		ctx.Reply(u, ext.ReplyTextString(fmt.Sprintf("Error - %s", err.Error())), nil)
+		if !isFloodWaitError(err) {
+			ctx.Reply(u, ext.ReplyTextString(fmt.Sprintf("Error - %s", err.Error())), nil)
+		}
+		return dispatcher.EndGroups
+	}
+	peer := &tg.InputPeerChannel{ChannelID: toPeer.ChannelID, AccessHash: toPeer.AccessHash}
+	builder := ctx.Sender.To(peer).Reply(messageID)
+	if !strings.Contains(link, "http://localhost") {
+		builder = builder.Markup(markup)
+	}
+	_, err = builder.StyledText(ctx, styling.Code(link))
+	if err != nil {
+		utils.Logger.Sugar().Error(err)
+		if !isFloodWaitError(err) {
+			ctx.Reply(u, ext.ReplyTextString(fmt.Sprintf("Error - %s", err.Error())), nil)
+		}
 	}
 	return dispatcher.EndGroups
 }
+
