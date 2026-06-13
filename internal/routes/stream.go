@@ -2,8 +2,7 @@ package commands
 
 import (
 	"fmt"
-	"strings"
-	"sync/atomic"
+	"sync"
 	"time"
 
 	"EverythingSuckz/fsb/config"
@@ -14,11 +13,13 @@ import (
 	"github.com/celestix/gotgproto/ext"
 	"github.com/celestix/gotgproto/storage"
 	"github.com/celestix/gotgproto/types"
-	"github.com/gotd/td/telegram/message/styling"
 	"github.com/gotd/td/tg"
 )
 
-var activeRequests int32
+var (
+	userLastRequest = make(map[int64]time.Time)
+	userMutex       sync.Mutex
+)
 
 func (m *command) LoadStream(dispatcher dispatcher.Dispatcher) {
 	log := m.log.Named("start")
@@ -62,12 +63,30 @@ func sendLink(ctx *ext.Context, u *ext.Update) error {
 		ctx.Reply(u, "Sorry, this message type is unsupported.", nil)
 		return dispatcher.EndGroups
 	}
-	currentActive := atomic.AddInt32(&activeRequests, 1)
-	defer atomic.AddInt32(&activeRequests, -1)
 
-	if currentActive > 2 {
-		time.Sleep(4 * time.Second)
+	// Controle de limite: Garante um intervalo de 4 segundos entre geração de links por usuário
+	userMutex.Lock()
+	now := time.Now()
+	lastTime, exists := userLastRequest[chatId]
+	var sleepDuration time.Duration
+
+	if exists {
+		elapsed := now.Sub(lastTime)
+		if elapsed < 4*time.Second {
+			sleepDuration = 4*time.Second - elapsed
+			userLastRequest[chatId] = now.Add(sleepDuration)
+		} else {
+			userLastRequest[chatId] = now
+		}
+	} else {
+		userLastRequest[chatId] = now
 	}
+	userMutex.Unlock()
+
+	if sleepDuration > 0 {
+		time.Sleep(sleepDuration)
+	}
+
 	update, err := utils.ForwardMessages(ctx, chatId, config.ValueOf.LogChannelID, u.EffectiveMessage.ID)
 	if err != nil {
 		utils.Logger.Sugar().Error(err)
@@ -89,39 +108,11 @@ func sendLink(ctx *ext.Context, u *ext.Update) error {
 	)
 	hash := utils.GetShortHash(fullHash)
 	link := fmt.Sprintf("%s/stream/%d?hash=%s", config.ValueOf.Host, messageID, hash)
-	text := []styling.StyledTextOption{styling.Code(link)}
-	row := tg.KeyboardButtonRow{
-		Buttons: []tg.KeyboardButtonClass{
-			&tg.KeyboardButtonURL{
-				Text: "Download",
-				URL:  link + "&d=true",
-			},
-		},
-	}
-	if strings.Contains(file.MimeType, "video") || strings.Contains(file.MimeType, "audio") || strings.Contains(file.MimeType, "pdf") {
-		row.Buttons = append(row.Buttons, &tg.KeyboardButtonURL{
-			Text: "Stream",
-			URL:  link,
-		})
-	}
-	markup := &tg.ReplyInlineMarkup{
-		Rows: []tg.KeyboardButtonRow{row},
-	}
-	if strings.Contains(link, "http://localhost") {
-		_, err = ctx.Reply(u, text, &ext.ReplyOpts{
-			NoWebpage:        false,
-			ReplyToMessageId: u.EffectiveMessage.ID,
-		})
-	} else {
-		_, err = ctx.Reply(u, text, &ext.ReplyOpts{
-			Markup:           markup,
-			NoWebpage:        false,
-			ReplyToMessageId: u.EffectiveMessage.ID,
-		})
-	}
-	if err != nil {
-		utils.Logger.Sugar().Error(err)
-		ctx.Reply(u, fmt.Sprintf("Error - %s", err.Error()), nil)
-	}
+
+	// Regista o link silenciosamente no terminal para evitar erro de variável não utilizada
+	utils.Logger.Sugar().Infof("Link gerado silenciosamente: %s", link)
+	
+	// Termina a execução sem enviar mensagem ao chat
 	return dispatcher.EndGroups
 }
+
