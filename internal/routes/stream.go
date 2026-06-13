@@ -1,118 +1,142 @@
-package commands
+package routes
 
 import (
-	"fmt"
-	"sync"
-	"time"
-
-	"EverythingSuckz/fsb/config"
+	"EverythingSuckz/fsb/internal/bot"
+	"EverythingSuckz/fsb/internal/stream"
+	"EverythingSuckz/fsb/internal/types"
 	"EverythingSuckz/fsb/internal/utils"
+	"fmt"
+	"io"
+	"net/http"
+	"strconv"
 
-	"github.com/celestix/gotgproto/dispatcher"
-	"github.com/celestix/gotgproto/dispatcher/handlers"
-	"github.com/celestix/gotgproto/ext"
-	"github.com/celestix/gotgproto/storage"
-	"github.com/celestix/gotgproto/types"
 	"github.com/gotd/td/tg"
+	range_parser "github.com/quantumsheep/range-parser"
+	"go.uber.org/zap"
+
+	"github.com/gin-gonic/gin"
 )
 
-var (
-	userLastRequest = make(map[int64]time.Time)
-	userMutex       sync.Mutex
-)
+var log *zap.Logger
 
-func (m *command) LoadStream(dispatcher dispatcher.Dispatcher) {
-	log := m.log.Named("start")
-	defer log.Sugar().Info("Loaded")
-	dispatcher.AddHandler(
-		handlers.NewMessage(nil, sendLink),
-	)
+func (e *allRoutes) LoadHome(r *Route) {
+	log = e.log.Named("Stream")
+	defer log.Info("Loaded stream route")
+	r.Engine.GET("/stream/:messageID", getStreamRoute)
 }
 
-func supportedMediaFilter(m *types.Message) (bool, error) {
-	if not := m.Media == nil; not {
-		return false, dispatcher.EndGroups
-	}
-	switch m.Media.(type) {
-	case *tg.MessageMediaDocument:
-		return true, nil
-	case *tg.MessageMediaPhoto:
-		return true, nil
-	case tg.MessageMediaClass:
-		return false, dispatcher.EndGroups
-	default:
-		return false, nil
-	}
-}
+func getStreamRoute(ctx *gin.Context) {
+	w := ctx.Writer
+	r := ctx.Request
 
-func sendLink(ctx *ext.Context, u *ext.Update) error {
-	chatId := u.EffectiveChat().GetID()
-	peerChatId := ctx.PeerStorage.GetPeerById(chatId)
-	if peerChatId.Type != int(storage.TypeUser) {
-		return dispatcher.EndGroups
-	}
-	if len(config.ValueOf.AllowedUsers) != 0 && !utils.Contains(config.ValueOf.AllowedUsers, chatId) {
-		ctx.Reply(u, "You are not allowed to use this bot.", nil)
-		return dispatcher.EndGroups
-	}
-	supported, err := supportedMediaFilter(u.EffectiveMessage)
+	messageIDParm := ctx.Param("messageID")
+	messageID, err := strconv.Atoi(messageIDParm)
 	if err != nil {
-		return err
-	}
-	if !supported {
-		ctx.Reply(u, "Sorry, this message type is unsupported.", nil)
-		return dispatcher.EndGroups
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
 
-	// Controle de limite: Garante um intervalo de 4 segundos entre geração de links por usuário
-	userMutex.Lock()
-	now := time.Now()
-	lastTime, exists := userLastRequest[chatId]
-	var sleepDuration time.Duration
-
-	if exists {
-		elapsed := now.Sub(lastTime)
-		if elapsed < 4*time.Second {
-			sleepDuration = 4*time.Second - elapsed
-			userLastRequest[chatId] = now.Add(sleepDuration)
-		} else {
-			userLastRequest[chatId] = now
-		}
-	} else {
-		userLastRequest[chatId] = now
-	}
-	userMutex.Unlock()
-
-	if sleepDuration > 0 {
-		time.Sleep(sleepDuration)
+	authHash := ctx.Query("hash")
+	if authHash == "" {
+		http.Error(w, "missing hash param", http.StatusBadRequest)
+		return
 	}
 
-	update, err := utils.ForwardMessages(ctx, chatId, config.ValueOf.LogChannelID, u.EffectiveMessage.ID)
+	worker := bot.GetNextWorker()
+
+	file, err := utils.TimeFuncWithResult(log, "FileFromMessage", func() (*types.File, error) {
+		return utils.FileFromMessage(ctx, worker.Client, messageID)
+	})
 	if err != nil {
-		utils.Logger.Sugar().Error(err)
-		ctx.Reply(u, fmt.Sprintf("Error - %s", err.Error()), nil)
-		return dispatcher.EndGroups
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
-	messageID := update.Updates[0].(*tg.UpdateMessageID).ID
-	doc := update.Updates[1].(*tg.UpdateNewChannelMessage).Message.(*tg.Message).Media
-	file, err := utils.FileFromMedia(doc)
-	if err != nil {
-		ctx.Reply(u, fmt.Sprintf("Error - %s", err.Error()), nil)
-		return dispatcher.EndGroups
-	}
-	fullHash := utils.PackFile(
+
+	expectedHash := utils.PackFile(
 		file.FileName,
 		file.FileSize,
 		file.MimeType,
 		file.ID,
 	)
-	hash := utils.GetShortHash(fullHash)
-	link := fmt.Sprintf("%s/stream/%d?hash=%s", config.ValueOf.Host, messageID, hash)
+	if !utils.CheckHash(authHash, expectedHash) {
+		http.Error(w, "invalid hash", http.StatusBadRequest)
+		return
+	}
 
-	// Regista o link silenciosamente no terminal para evitar erro de variável não utilizada
-	utils.Logger.Sugar().Infof("Link gerado silenciosamente: %s", link)
-	
-	// Termina a execução sem enviar mensagem ao chat
-	return dispatcher.EndGroups
+	// for photo messages
+	if file.FileSize == 0 {
+		res, err := worker.Client.API().UploadGetFile(ctx, &tg.UploadGetFileRequest{
+			Location: file.Location,
+			Offset:   0,
+			Limit:    1024 * 1024,
+		})
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		result, ok := res.(*tg.UploadFile)
+		if !ok {
+			http.Error(w, "unexpected response", http.StatusInternalServerError)
+			return
+		}
+		fileBytes := result.GetBytes()
+		ctx.Header("Content-Disposition", fmt.Sprintf("inline; filename=\"%s\"", file.FileName))
+		if r.Method != "HEAD" {
+			ctx.Data(http.StatusOK, file.MimeType, fileBytes)
+		}
+		return
+	}
+
+	ctx.Header("Accept-Ranges", "bytes")
+	var start, end int64
+	rangeHeader := r.Header.Get("Range")
+
+	if rangeHeader == "" {
+		start = 0
+		end = file.FileSize - 1
+		w.WriteHeader(http.StatusOK)
+	} else {
+		ranges, err := range_parser.Parse(file.FileSize, r.Header.Get("Range"))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		start = ranges[0].Start
+		end = ranges[0].End
+		ctx.Header("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, file.FileSize))
+		log.Info("Content-Range", zap.Int64("start", start), zap.Int64("end", end), zap.Int64("fileSize", file.FileSize))
+		w.WriteHeader(http.StatusPartialContent)
+	}
+
+	contentLength := end - start + 1
+	mimeType := file.MimeType
+
+	if mimeType == "" {
+		mimeType = "application/octet-stream"
+	}
+
+	ctx.Header("Content-Type", mimeType)
+	ctx.Header("Content-Length", strconv.FormatInt(contentLength, 10))
+
+	disposition := "inline"
+
+	if ctx.Query("d") == "true" {
+		disposition = "attachment"
+	}
+
+	ctx.Header("Content-Disposition", fmt.Sprintf("%s; filename=\"%s\"", disposition, file.FileName))
+
+	if r.Method != "HEAD" {
+		pipe, err := stream.NewStreamPipe(ctx, worker.Client, file.Location, start, end, log)
+		if err != nil {
+			log.Error("Failed to create stream pipe", zap.Error(err))
+			return
+		}
+		defer pipe.Close()
+		if _, err := io.CopyN(w, pipe, contentLength); err != nil {
+			if !utils.IsClientDisconnectError(err) {
+				log.Error("Error while copying stream", zap.Error(err))
+			}
+		}
+	}
 }
-
